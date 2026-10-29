@@ -1,13 +1,14 @@
 #Requires -RunAsAdministrator
 
 $ErrorActionPreference = 'Continue'
-$runStamp           = Get-Date -Format 'yyyyMMdd_HHmmss'
-$backupRunDirectory = Join-Path $PSScriptRoot "Backup\Backup_$runStamp"
+$runStamp                = Get-Date -Format 'yyyyMMdd_HHmmss'
+$backupRunDirectory      = Join-Path $PSScriptRoot "Backup\Backup_$runStamp"
 $registryBackupDirectory = Join-Path $backupRunDirectory 'Registry'
 $fileBackupDirectory     = Join-Path $backupRunDirectory 'Files'
-$manifestFilePath   = Join-Path $backupRunDirectory 'manifest.csv'
-$removalLogFilePath = Join-Path $PSScriptRoot "removal_$runStamp.log"
-New-Item -ItemType Directory -Path $registryBackupDirectory, $fileBackupDirectory -Force | Out-Null
+$taskBackupDirectory     = Join-Path $backupRunDirectory 'ScheduledTasks'
+$manifestFilePath        = Join-Path $backupRunDirectory 'manifest.csv'
+$removalLogFilePath      = Join-Path $PSScriptRoot "removal_$runStamp.log"
+New-Item -ItemType Directory -Path $registryBackupDirectory, $fileBackupDirectory, $taskBackupDirectory -Force | Out-Null
 
 $fortinetFolderPaths = @(
     'C:\Program Files\Fortinet',
@@ -17,8 +18,18 @@ $fortinetFolderPaths = @(
 
 $script:IsDryRunPass            = $true
 $script:VerifiedRegistryBackups = @{}   # native key path -> verified backup file
+$script:VerifiedTaskBackups     = @{}   # task path + name -> verified backup file
 $script:ManifestRows            = New-Object System.Collections.Generic.List[object]
 $script:RegistryBackupCounter   = 0
+$script:DelayedDeleteCount      = 0
+
+# Windows API used to schedule locked files for deletion at the next reboot
+if (-not ('FortiCleanup.NativeFile' -as [type])) {
+    Add-Type -Namespace FortiCleanup -Name NativeFile -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+'@
+}
 
 function Write-RemovalLog {
     param([string]$Message)
@@ -50,14 +61,16 @@ function ConvertTo-NativeRegistryPath {
     return $nativePath
 }
 
-# Only these key shapes may ever be deleted. Anything else is refused.
+# Only these key shapes may ever be deleted or exported. Anything else is refused.
 $allowedNativeRemovalPatterns = @(
     '^HKEY_USERS\\[^\\]+\\Software\\Fortinet$',
     '^HKEY_USERS\\[^\\]+\\Software\\Microsoft\\Installer\\Products\\[^\\]+$',
     '^HKEY_USERS\\[^\\]+\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\[^\\]+$',
+    '^HKEY_USERS\\[^\\]+\\Software\\Microsoft\\Windows\\CurrentVersion\\Run(Once)?$',
     '^HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes\\Installer\\Products\\[^\\]+$',
     '^HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes\\Installer\\UserData\\[^\\]+\\Products\\[^\\]+$',
     '^HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\[^\\]+$',
+    '^HKEY_LOCAL_MACHINE\\SOFTWARE\\(WOW6432Node\\)?Microsoft\\Windows\\CurrentVersion\\Run(Once)?$',
     '^HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\[^\\]+$',
     '^HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes\\Installer\\UpgradeCodes\\[^\\]+$'
 )
@@ -99,6 +112,75 @@ function Get-FortiClientKeysInLoadedUserHive {
     }
 
     return $foundKeyPaths
+}
+
+# Finds FortiClient services (name or binary path)
+function Get-FortiServices {
+    return @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -like 'Forti*' -or $_.Name -like 'FA_*' -or $_.Name -like 'FCT_*' -or $_.PathName -like '*\Fortinet\*'
+    })
+}
+
+# Finds FortiClient scheduled tasks (name or action path)
+function Get-FortiScheduledTasks {
+    return @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+        $_.TaskName -like '*Forti*' -or @($_.Actions | Where-Object { $_.Execute -like '*Fortinet*' }).Count -gt 0
+    })
+}
+
+# Finds Run and RunOnce values that start FortiClient (machine-wide and loaded user hives)
+function Get-FortiRunValues {
+    $runKeyPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce'
+    )
+    foreach ($hiveKey in (Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue)) {
+        if ($hiveKey.PSChildName -notmatch '^S-1-5-21-') { continue }
+        $runKeyPaths += "Registry::HKEY_USERS\$($hiveKey.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Run"
+        $runKeyPaths += "Registry::HKEY_USERS\$($hiveKey.PSChildName)\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+    }
+
+    $fortiRunValues = @()
+    foreach ($runKeyPath in $runKeyPaths) {
+        if (-not (Test-Path -LiteralPath $runKeyPath)) { continue }
+        $runKeyProperties = Get-ItemProperty -LiteralPath $runKeyPath -ErrorAction SilentlyContinue
+        foreach ($runProperty in $runKeyProperties.PSObject.Properties) {
+            if ($runProperty.Name -like 'PS*') { continue }
+            $runValueText = [string]$runProperty.Value
+            if ($runProperty.Name -like '*Forti*' -or $runValueText -like '*Fortinet*' -or $runValueText -like '*FortiTray*') {
+                $fortiRunValues += [pscustomobject]@{
+                    NativeKeyPath = (ConvertTo-NativeRegistryPath $runKeyPath)
+                    ValueName     = $runProperty.Name
+                    Data          = $runValueText
+                }
+            }
+        }
+    }
+    return $fortiRunValues
+}
+
+# Finds FortiClient shortcuts on the public desktop, Start menu, and every user's desktop and Start menu
+function Get-FortiShortcuts {
+    $shortcutSearchFolders = @(
+        'C:\Users\Public\Desktop',
+        'C:\ProgramData\Microsoft\Windows\Start Menu\Programs'
+    )
+    foreach ($userFolder in (Get-ChildItem -LiteralPath 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue)) {
+        $shortcutSearchFolders += "$($userFolder.FullName)\Desktop"
+        $shortcutSearchFolders += "$($userFolder.FullName)\OneDrive\Desktop"
+        $shortcutSearchFolders += "$($userFolder.FullName)\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"
+    }
+
+    $fortiShortcutPaths = @()
+    foreach ($searchFolder in $shortcutSearchFolders) {
+        if (-not (Test-Path -LiteralPath $searchFolder)) { continue }
+        foreach ($shortcutItem in (Get-ChildItem -LiteralPath $searchFolder -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*Forti*' })) {
+            $fortiShortcutPaths += $shortcutItem.FullName
+        }
+    }
+    return $fortiShortcutPaths
 }
 
 # Read-only inventory of everything the removal would touch.
@@ -171,7 +253,7 @@ function Get-RemovalInventory {
         }
     }
 
-    # E. Loaded user hives only (HKEY_USERS\<SID>)
+    # E. Loaded user hives only (HKEY_USERS\<SID>). Signed-out profiles are not mounted.
     $loadedUserKeys = @()
     foreach ($hiveKey in (Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue)) {
         if ($hiveKey.PSChildName -notmatch '^S-1-5-21-') { continue }
@@ -182,6 +264,12 @@ function Get-RemovalInventory {
     $signedOutProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -Filter "Special=False AND Loaded=False" -ErrorAction SilentlyContinue |
         Where-Object { $_.SID -like 'S-1-5-21-*' })
 
+    # G. Services, H. scheduled tasks, I. Run values, J. shortcuts
+    $fortiServices   = Get-FortiServices
+    $fortiTasks      = Get-FortiScheduledTasks
+    $fortiRunValues  = Get-FortiRunValues
+    $fortiShortcuts  = Get-FortiShortcuts
+
     Write-RemovalLog "Inventory:"
     Write-RemovalLog " Add/Remove Programs entries: $($uninstallEntries.Count)"
     foreach ($uninstallEntry in $uninstallEntries) { Write-RemovalLog "   - $($uninstallEntry.DisplayName) $($uninstallEntry.DisplayVersion) [$($uninstallEntry.ProductCodeOrKeyName)]" }
@@ -190,16 +278,28 @@ function Get-RemovalInventory {
     Write-RemovalLog " UpgradeCodes values: $($upgradeCodeValues.Count)"
     Write-RemovalLog " Loaded user hive FortiClient keys: $($loadedUserKeys.Count)"
     foreach ($loadedUserKey in $loadedUserKeys) { Write-RemovalLog "   - $loadedUserKey" }
+    Write-RemovalLog " Services: $($fortiServices.Count)"
+    foreach ($fortiService in $fortiServices) { Write-RemovalLog "   - $($fortiService.Name) ($($fortiService.State), start: $($fortiService.StartMode))" }
+    Write-RemovalLog " Scheduled tasks: $($fortiTasks.Count)"
+    foreach ($fortiTask in $fortiTasks) { Write-RemovalLog "   - $($fortiTask.TaskPath)$($fortiTask.TaskName)" }
+    Write-RemovalLog " Run/RunOnce values: $($fortiRunValues.Count)"
+    foreach ($fortiRunValue in $fortiRunValues) { Write-RemovalLog "   - $($fortiRunValue.NativeKeyPath) [$($fortiRunValue.ValueName)]" }
+    Write-RemovalLog " Shortcuts: $($fortiShortcuts.Count)"
+    foreach ($fortiShortcut in $fortiShortcuts) { Write-RemovalLog "   - $fortiShortcut" }
     Write-RemovalLog " Signed-out profiles (not mounted, not touched): $($signedOutProfiles.Count)"
     foreach ($signedOutProfile in $signedOutProfiles) { Write-RemovalLog "   - $($signedOutProfile.SID) $($signedOutProfile.LocalPath)" }
 
     return [pscustomobject]@{
-        UninstallEntries = $uninstallEntries
-        InstallerRecords = $installerRecords
-        UserDataKeys     = $userDataKeys
+        UninstallEntries  = $uninstallEntries
+        InstallerRecords  = $installerRecords
+        UserDataKeys      = $userDataKeys
         UpgradeCodeValues = $upgradeCodeValues
-        LoadedUserKeys   = $loadedUserKeys
+        LoadedUserKeys    = $loadedUserKeys
         SignedOutProfiles = $signedOutProfiles
+        Services          = $fortiServices
+        ScheduledTasks    = $fortiTasks
+        RunValues         = $fortiRunValues
+        Shortcuts         = $fortiShortcuts
     }
 }
 
@@ -227,7 +327,38 @@ function Export-RegistryKeyVerified {
     return $verified
 }
 
-# Copies a Fortinet folder with robocopy. Best effort: logs the result but never blocks removal.
+# Exports one scheduled task to XML and verifies the file is non-empty.
+function Export-ScheduledTaskVerified {
+    param($Task)
+    $taskKey  = "$($Task.TaskPath)$($Task.TaskName)"
+    $taskFile = Join-Path $taskBackupDirectory (($taskKey -replace '[^A-Za-z0-9]', '_') + '.xml')
+    try {
+        $taskXml = Export-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop
+        Set-Content -LiteralPath $taskFile -Value $taskXml -Encoding UTF8
+    } catch {
+        Write-RemovalLog " task export error: $($_.Exception.Message)"
+    }
+    $taskSize = if (Test-Path -LiteralPath $taskFile) { (Get-Item -LiteralPath $taskFile).Length } else { 0 }
+    $taskVerified = ($taskSize -gt 0) -and [bool](Select-String -LiteralPath $taskFile -Pattern '<Task' -Quiet -ErrorAction SilentlyContinue)
+    Add-ManifestRow 'ScheduledTask' $taskKey $taskFile $taskSize $taskVerified ''
+    if ($taskVerified) { $script:VerifiedTaskBackups[$taskKey] = $taskFile }
+    return $taskVerified
+}
+
+# Copies a shortcut or folder (best effort). Removal is not blocked by this.
+function Backup-ItemBestEffort {
+    param([string]$SourcePath, [int]$Index)
+    $shortcutBackupFolder = Join-Path $fileBackupDirectory 'Shortcuts'
+    New-Item -ItemType Directory -Path $shortcutBackupFolder -Force | Out-Null
+    $itemName    = Split-Path -Leaf $SourcePath
+    $destination = Join-Path $shortcutBackupFolder ("{0:D3}_{1}" -f $Index, ($itemName -replace '[^A-Za-z0-9._-]', '_'))
+    Copy-Item -LiteralPath $SourcePath -Destination $destination -Recurse -Force -ErrorAction SilentlyContinue
+    $copied = Test-Path -LiteralPath $destination
+    Add-ManifestRow 'Shortcut' $SourcePath $destination 0 $copied 'best effort'
+    Write-RemovalLog " shortcut backup (best effort) $(if ($copied) { 'copied' } else { 'failed' }): $SourcePath"
+}
+
+# Copies a Fortinet folder with robocopy (best effort).
 function Backup-FolderBestEffort {
     param([string]$SourceFolder)
     $folderBackupName  = $SourceFolder -replace '[^A-Za-z0-9]', '_'
@@ -242,7 +373,7 @@ function Backup-FolderBestEffort {
     Write-RemovalLog " file backup (best effort) ${copyStatus}: $SourceFolder -> $destinationFolder"
 }
 
-# Backs up and verifies every item the removal would touch. Returns $false if the machine-wide backup fails.
+# Backs up and verifies everything the removal would touch. Returns $false if the machine-wide backup fails.
 function Backup-AllTargetsVerified {
     param($Inventory)
     Write-RemovalLog "Backing up and verifying everything the removal would touch"
@@ -273,20 +404,32 @@ function Backup-AllTargetsVerified {
     }
     if (-not $machineWideBackupsOk) { return $false }
 
-    # Every individual key the removal would delete or depend on
+    # Every individual registry key the removal would delete or depend on
     $keysToBackup = @()
     foreach ($uninstallEntry in $Inventory.UninstallEntries) { $keysToBackup += $uninstallEntry.NativeKeyPath }
     foreach ($installerRecord in $Inventory.InstallerRecords) { $keysToBackup += (ConvertTo-NativeRegistryPath $installerRecord.PSPath) }
     foreach ($userDataKey in $Inventory.UserDataKeys) { $keysToBackup += $userDataKey }
     foreach ($loadedUserKey in $Inventory.LoadedUserKeys) { $keysToBackup += $loadedUserKey }
     foreach ($upgradeCodeValue in $Inventory.UpgradeCodeValues) { $keysToBackup += $upgradeCodeValue.NativeKeyPath }
+    foreach ($runValue in $Inventory.RunValues) { $keysToBackup += $runValue.NativeKeyPath }
 
     foreach ($nativeKeyPath in ($keysToBackup | Where-Object { $_ } | Select-Object -Unique)) {
         $keyVerified = Export-RegistryKeyVerified -NativePath $nativeKeyPath
         Write-RemovalLog " $(if ($keyVerified) { 'verified' } else { 'FAILED' }) key: $nativeKeyPath"
     }
 
-    # Every Fortinet folder that exists
+    # Scheduled tasks (exported to XML)
+    foreach ($fortiTask in $Inventory.ScheduledTasks) {
+        $taskVerified = Export-ScheduledTaskVerified -Task $fortiTask
+        Write-RemovalLog " $(if ($taskVerified) { 'verified' } else { 'FAILED' }) task: $($fortiTask.TaskPath)$($fortiTask.TaskName)"
+    }
+
+    # Shortcuts and Fortinet folders (best effort)
+    $shortcutIndex = 0
+    foreach ($shortcutPath in $Inventory.Shortcuts) {
+        $shortcutIndex++
+        Backup-ItemBestEffort -SourcePath $shortcutPath -Index $shortcutIndex
+    }
     foreach ($fortinetFolderPath in $fortinetFolderPaths) {
         if (-not (Test-Path -LiteralPath $fortinetFolderPath)) { continue }
         Backup-FolderBestEffort -SourceFolder $fortinetFolderPath
@@ -298,6 +441,22 @@ function Backup-AllTargetsVerified {
     $failedCount   = @($manifestRows | Where-Object { -not $_.Verified }).Count
     Write-RemovalLog "Manifest written: $manifestFilePath ($verifiedCount verified, $failedCount failed or skipped)"
     return $true
+}
+
+# Stops FortiClient processes. Live runs repeat up to 3 times in case a process restarts.
+function Stop-FortiClientProcesses {
+    param([bool]$IsDryRun)
+    $killPassCount = if ($IsDryRun) { 1 } else { 3 }
+    for ($killPass = 1; $killPass -le $killPassCount; $killPass++) {
+        $fortiProcesses = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*\Fortinet\*' })
+        if ($fortiProcesses.Count -eq 0) { break }
+        foreach ($fortiProcess in $fortiProcesses) {
+            if ($IsDryRun) { Write-RemovalLog " WOULD STOP process $($fortiProcess.Name)"; continue }
+            Write-RemovalLog " stopping process $($fortiProcess.Name)"
+            Stop-Process -Id $fortiProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+        if (-not $IsDryRun) { Start-Sleep -Seconds 2 }
+    }
 }
 
 # Removes one registry key only if its backup was verified in this run.
@@ -325,7 +484,7 @@ function Remove-RegistryKeySafely {
         Remove-Item -LiteralPath $providerPath -Recurse -Force -ErrorAction Stop
         Write-RemovalLog " REMOVED: $nativePath ($RemovalReason)"
     } catch {
-        Write-RemovalLog " FAILED: $nativePath ($RemovalReason): $_"
+        Write-RemovalLog " FAILED: $nativePath ($RemovalReason): $($_.Exception.Message)"
     }
 }
 
@@ -344,8 +503,84 @@ function Remove-UpgradeCodeValueSafely {
         Write-RemovalLog " WOULD REMOVE UpgradeCodes value $ValueName under $NativeKeyPath"
         return
     }
-    Remove-ItemProperty -LiteralPath "Registry::$NativeKeyPath" -Name $ValueName -ErrorAction SilentlyContinue
-    Write-RemovalLog " REMOVED UpgradeCodes value $ValueName under $NativeKeyPath"
+    try {
+        Remove-ItemProperty -LiteralPath "Registry::$NativeKeyPath" -Name $ValueName -ErrorAction Stop
+        Write-RemovalLog " REMOVED UpgradeCodes value $ValueName under $NativeKeyPath"
+    } catch {
+        Write-RemovalLog " FAILED UpgradeCodes value $ValueName : $($_.Exception.Message)"
+    }
+}
+
+# Removes one Run/RunOnce value only if its key backup was verified.
+function Remove-RunValueSafely {
+    param($RunValue)
+    if (-not (Test-IsAllowedRemovalPath $RunValue.NativeKeyPath)) {
+        Write-RemovalLog " REFUSED Run value (not on allowlist): $($RunValue.NativeKeyPath)"
+        return
+    }
+    if (-not $script:VerifiedRegistryBackups.ContainsKey($RunValue.NativeKeyPath)) {
+        Write-RemovalLog " SKIPPED Run value (no verified backup): $($RunValue.NativeKeyPath) [$($RunValue.ValueName)]"
+        return
+    }
+    if ($script:IsDryRunPass) {
+        Write-RemovalLog " WOULD REMOVE Run value $($RunValue.ValueName) under $($RunValue.NativeKeyPath)"
+        return
+    }
+    try {
+        Remove-ItemProperty -LiteralPath "Registry::$($RunValue.NativeKeyPath)" -Name $RunValue.ValueName -ErrorAction Stop
+        Write-RemovalLog " REMOVED Run value $($RunValue.ValueName) under $($RunValue.NativeKeyPath)"
+    } catch {
+        Write-RemovalLog " FAILED Run value $($RunValue.ValueName): $($_.Exception.Message)"
+    }
+}
+
+# Unregisters one scheduled task only if its XML backup was verified.
+function Remove-FortiScheduledTaskSafely {
+    param($Task)
+    $taskKey = "$($Task.TaskPath)$($Task.TaskName)"
+    if (-not $script:VerifiedTaskBackups.ContainsKey($taskKey)) {
+        Write-RemovalLog " SKIPPED task (no verified backup): $taskKey"
+        return
+    }
+    if ($script:IsDryRunPass) {
+        Write-RemovalLog " WOULD REMOVE task $taskKey, backup: $($script:VerifiedTaskBackups[$taskKey])"
+        return
+    }
+    try {
+        Unregister-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -Confirm:$false -ErrorAction Stop
+        Write-RemovalLog " REMOVED task $taskKey"
+    } catch {
+        Write-RemovalLog " FAILED task $taskKey : $($_.Exception.Message)"
+    }
+}
+
+# Deletes a file or folder. Anything still locked is scheduled for deletion at the next reboot.
+function Remove-PathWithFallback {
+    param([string]$TargetPath, [string]$ItemKind)
+    if (-not (Test-Path -LiteralPath $TargetPath)) { return }
+    if ($script:IsDryRunPass) { Write-RemovalLog " WOULD REMOVE $ItemKind $TargetPath"; return }
+
+    Remove-Item -LiteralPath $TargetPath -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath $TargetPath)) { Write-RemovalLog " REMOVED $ItemKind $TargetPath"; return }
+
+    # Some items are still locked: delete the rest individually, deepest first
+    $remainingChildren = @(Get-ChildItem -LiteralPath $TargetPath -Recurse -Force -ErrorAction SilentlyContinue |
+        Sort-Object { $_.FullName.Length } -Descending)
+    foreach ($remainingChild in $remainingChildren) {
+        try {
+            Remove-Item -LiteralPath $remainingChild.FullName -Force -ErrorAction Stop
+        } catch {
+            Write-RemovalLog " locked, scheduled for deletion at reboot: $($remainingChild.FullName) ($($_.Exception.Message))"
+            if ([FortiCleanup.NativeFile]::MoveFileEx($remainingChild.FullName, $null, 4)) { $script:DelayedDeleteCount++ }
+        }
+    }
+    Remove-Item -LiteralPath $TargetPath -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $TargetPath) {
+        if ([FortiCleanup.NativeFile]::MoveFileEx($TargetPath, $null, 4)) { $script:DelayedDeleteCount++ }
+        Write-RemovalLog " scheduled for removal at reboot: $TargetPath"
+    } else {
+        Write-RemovalLog " REMOVED $ItemKind $TargetPath"
+    }
 }
 
 # One pass over the inventory. Dry pass changes nothing. Live pass makes the changes.
@@ -355,17 +590,29 @@ function Invoke-RemovalPass {
     $passLabel = if ($IsDryRun) { 'DRY RUN' } else { 'LIVE' }
     Write-RemovalLog "===== $passLabel PASS START ====="
 
-    # 1. Stop services and processes
-    foreach ($fortiService in (Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'Forti*' -or $_.DisplayName -like '*Forti*' })) {
-        if ($IsDryRun) { Write-RemovalLog " WOULD STOP service $($fortiService.Name)" }
-        else { Write-RemovalLog " stopping service $($fortiService.Name)"; Stop-Service -Name $fortiService.Name -Force -ErrorAction SilentlyContinue }
+    # 1. Disable and stop services first so they cannot restart FortiClient
+    foreach ($fortiService in $Inventory.Services) {
+        if ($IsDryRun) { Write-RemovalLog " WOULD DISABLE and STOP service $($fortiService.Name)"; continue }
+        Write-RemovalLog " disabling and stopping service $($fortiService.Name)"
+        Set-Service -Name $fortiService.Name -StartupType Disabled -ErrorAction SilentlyContinue
+        Stop-Service -Name $fortiService.Name -Force -ErrorAction SilentlyContinue
     }
-    foreach ($fortiProcess in (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*\Fortinet\*' })) {
-        if ($IsDryRun) { Write-RemovalLog " WOULD STOP process $($fortiProcess.Name)" }
-        else { Write-RemovalLog " stopping process $($fortiProcess.Name)"; Stop-Process -Id $fortiProcess.Id -Force -ErrorAction SilentlyContinue }
+    Stop-FortiClientProcesses -IsDryRun $IsDryRun
+
+    # 2. Scheduled tasks that launch FortiClient
+    foreach ($fortiTask in $Inventory.ScheduledTasks) {
+        Remove-FortiScheduledTaskSafely -Task $fortiTask
     }
 
-    # 2. Uninstall each Add/Remove Programs entry (only if its key backup is verified)
+    # 3. Run/RunOnce autostart values
+    foreach ($runValue in $Inventory.RunValues) {
+        Remove-RunValueSafely -RunValue $runValue
+    }
+
+    # 4. Stop any FortiClient process that was restarted before the autostart entries were removed
+    Stop-FortiClientProcesses -IsDryRun $IsDryRun
+
+    # 5. Uninstall each Add/Remove Programs entry (only if its key backup is verified)
     foreach ($fortiClientEntry in $Inventory.UninstallEntries) {
         if (-not $script:VerifiedRegistryBackups.ContainsKey($fortiClientEntry.NativeKeyPath)) {
             Write-RemovalLog " SKIPPED uninstall (no verified backup): $($fortiClientEntry.DisplayName)"
@@ -398,7 +645,7 @@ function Invoke-RemovalPass {
         Write-RemovalLog " exit code: $($uninstallProcess.ExitCode)"
     }
 
-    # 3. Machine-wide leftover keys
+    # 6. Leftover registry keys
     foreach ($installerRecord in $Inventory.InstallerRecords) {
         Remove-RegistryKeySafely -RegistryPathInput $installerRecord.PSPath -RemovalReason 'Installer Products record'
     }
@@ -413,22 +660,18 @@ function Invoke-RemovalPass {
             Remove-RegistryKeySafely -RegistryPathInput $fortiClientEntry.NativeKeyPath -RemovalReason 'Add/Remove Programs key'
         }
     }
-
-    # 4. Loaded user hives
     foreach ($loadedUserKey in $Inventory.LoadedUserKeys) {
         Remove-RegistryKeySafely -RegistryPathInput $loadedUserKey -RemovalReason 'loaded user hive'
     }
 
-    # 5. Install and data folders (always removed, regardless of file backup result)
+    # 7. Shortcuts (always removed)
+    foreach ($shortcutPath in $Inventory.Shortcuts) {
+        Remove-PathWithFallback -TargetPath $shortcutPath -ItemKind 'shortcut'
+    }
+
+    # 8. Install and data folders (always removed)
     foreach ($fortinetFolderPath in $fortinetFolderPaths) {
-        if (-not (Test-Path -LiteralPath $fortinetFolderPath)) { continue }
-        if ($IsDryRun) { Write-RemovalLog " WOULD REMOVE folder $fortinetFolderPath"; continue }
-        Remove-Item -LiteralPath $fortinetFolderPath -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $fortinetFolderPath) {
-            Write-RemovalLog " WARNING: folder still present after removal: $fortinetFolderPath"
-        } else {
-            Write-RemovalLog " REMOVED folder $fortinetFolderPath"
-        }
+        Remove-PathWithFallback -TargetPath $fortinetFolderPath -ItemKind 'folder'
     }
 
     Write-RemovalLog "===== $passLabel PASS END ====="
@@ -459,6 +702,11 @@ if ($typedConfirmation -cne 'DELETE') {
 Invoke-RemovalPass -IsDryRun $false -Inventory $removalInventory
 
 Write-RemovalLog "Verification"
+$remainingServices = Get-FortiServices
+$remainingTasks    = Get-FortiScheduledTasks
+$remainingRunValues = Get-FortiRunValues
+$remainingShortcuts = Get-FortiShortcuts
+$remainingFolders  = @($fortinetFolderPaths | Where-Object { Test-Path -LiteralPath $_ })
 $remainingUninstallEntries = @()
 foreach ($uninstallRootPath in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
     if (-not (Test-Path $uninstallRootPath)) { continue }
@@ -466,6 +714,11 @@ foreach ($uninstallRootPath in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersio
         if ((Get-ItemProperty $uninstallKey.PSPath).DisplayName -like '*FortiClient*') { $remainingUninstallEntries += $uninstallKey }
     }
 }
-Write-RemovalLog "Remaining machine-wide Add/Remove entries: $($remainingUninstallEntries.Count)"
+Write-RemovalLog "Remaining services: $($remainingServices.Count), scheduled tasks: $($remainingTasks.Count), Run values: $($remainingRunValues.Count), shortcuts: $($remainingShortcuts.Count), folders: $($remainingFolders.Count), Add/Remove entries: $($remainingUninstallEntries.Count)"
+Write-RemovalLog "Items scheduled for deletion at reboot: $($script:DelayedDeleteCount)"
 Write-RemovalLog "Signed-out profiles were not modified."
-Write-RemovalLog "Done. Reboot before reinstalling. Log: $removalLogFilePath"
+if (($script:DelayedDeleteCount -gt 0) -or $remainingFolders.Count -gt 0) {
+    Write-RemovalLog "REBOOT REQUIRED to finish removing locked files. Log: $removalLogFilePath"
+} else {
+    Write-RemovalLog "Done. Reboot before reinstalling. Log: $removalLogFilePath"
+}
