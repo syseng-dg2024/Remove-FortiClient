@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 
 $ErrorActionPreference = 'Continue'
-$fortiClientLogDirectory = 'C:\temp\FortiClientRemoval'
+$fortiClientLogDirectory = $PSScriptRoot
 $registryBackupDirectory = Join-Path $fortiClientLogDirectory 'backup'
 New-Item -ItemType Directory -Path $registryBackupDirectory -Force | Out-Null
 $removalLogFilePath = Join-Path $fortiClientLogDirectory ("removal_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))

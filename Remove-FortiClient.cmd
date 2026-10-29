@@ -1,5 +1,4 @@
 @echo off
-cd /d "%~dp0"
 
 net session >nul 2>&1
 if %errorlevel% neq 0 (
@@ -7,7 +6,11 @@ if %errorlevel% neq 0 (
     exit /b %ERRORLEVEL%
 )
 
-set "PS1=%~dp0Remove-FortiClient.ps1"
+set "WORKDIR=%~dp0Remove-FortiClient"
+if not exist "%WORKDIR%" mkdir "%WORKDIR%"
+cd /d "%WORKDIR%"
+
+set "PS1=%WORKDIR%\Remove-FortiClient.ps1"
 set "URL=https://raw.githubusercontent.com/syseng-dg2024/Remove-FortiClient/main/Remove-FortiClient.ps1"
 
 echo Downloading Remove-FortiClient.ps1 from GitHub...
