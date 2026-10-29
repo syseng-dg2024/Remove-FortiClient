@@ -560,21 +560,30 @@ function Remove-PathWithFallback {
     if (-not (Test-Path -LiteralPath $TargetPath)) { return }
     if ($script:IsDryRunPass) { Write-RemovalLog " WOULD REMOVE $ItemKind $TargetPath"; return }
 
-    Remove-Item -LiteralPath $TargetPath -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TargetPath -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
     if (-not (Test-Path -LiteralPath $TargetPath)) { Write-RemovalLog " REMOVED $ItemKind $TargetPath"; return }
 
-    # Some items are still locked: delete the rest individually, deepest first
+    # Some items are still locked: work through the children deepest first
     $remainingChildren = @(Get-ChildItem -LiteralPath $TargetPath -Recurse -Force -ErrorAction SilentlyContinue |
         Sort-Object { $_.FullName.Length } -Descending)
     foreach ($remainingChild in $remainingChildren) {
+        if ($remainingChild.PSIsContainer) {
+            $folderHasChildren = [bool](Get-ChildItem -LiteralPath $remainingChild.FullName -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($folderHasChildren) {
+                # Still holds locked items, so schedule the folder for deletion at reboot
+                if ([FortiCleanup.NativeFile]::MoveFileEx($remainingChild.FullName, $null, 4)) { $script:DelayedDeleteCount++ }
+                continue
+            }
+        }
         try {
-            Remove-Item -LiteralPath $remainingChild.FullName -Force -ErrorAction Stop
+            Remove-Item -LiteralPath $remainingChild.FullName -Force -Confirm:$false -ErrorAction Stop
         } catch {
             Write-RemovalLog " locked, scheduled for deletion at reboot: $($remainingChild.FullName) ($($_.Exception.Message))"
             if ([FortiCleanup.NativeFile]::MoveFileEx($remainingChild.FullName, $null, 4)) { $script:DelayedDeleteCount++ }
         }
     }
-    Remove-Item -LiteralPath $TargetPath -Recurse -Force -ErrorAction SilentlyContinue
+
+    Remove-Item -LiteralPath $TargetPath -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $TargetPath) {
         if ([FortiCleanup.NativeFile]::MoveFileEx($TargetPath, $null, 4)) { $script:DelayedDeleteCount++ }
         Write-RemovalLog " scheduled for removal at reboot: $TargetPath"
