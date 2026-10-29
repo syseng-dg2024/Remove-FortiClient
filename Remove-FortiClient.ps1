@@ -15,6 +15,7 @@ $fortinetFolders = @('C:\Program Files\Fortinet', 'C:\Program Files (x86)\Fortin
 # ---- Every registry location, defined once. Everything below reads from these two tables. ----
 # Machine-wide paths are relative to HKEY_LOCAL_MACHINE\
 $machineRegistry = [ordered]@{
+    Fortinet          = 'SOFTWARE\Fortinet'
     InstallerProducts = 'SOFTWARE\Classes\Installer\Products'
     UserData          = 'SOFTWARE\Classes\Installer\UserData'
     UpgradeCodes      = 'SOFTWARE\Classes\Installer\UpgradeCodes'
@@ -75,12 +76,12 @@ function ConvertTo-NativeKey {
 function Get-MachineProvider { param([string]$Name) return "HKLM:\$($machineRegistry[$Name])" }
 function Get-MachineNative   { param([string]$Name) return "HKEY_LOCAL_MACHINE\$($machineRegistry[$Name])" }
 
-# Allowed: children of any machine location, the exact Run/RunOnce roots, and children of per-user locations.
+# Allowed: children of any machine location, the exact Fortinet/Run/RunOnce roots, and children of per-user locations.
 function Test-AllowedKey {
     param([string]$Key)
     foreach ($name in $machineRegistry.Keys) {
         $root = Get-MachineNative $name
-        if ($Key.Equals($root, [StringComparison]::OrdinalIgnoreCase) -and $name -like 'Run*') { return $true }
+        if ($Key.Equals($root, [StringComparison]::OrdinalIgnoreCase) -and (($name -like 'Run*') -or ($name -eq 'Fortinet'))) { return $true }
         if ($Key.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
     foreach ($rel in $userRegistry.Values) {
@@ -146,6 +147,10 @@ function Get-Inventory {
         }
     }
 
+    # Machine-wide FortiClient settings root (HKLM\SOFTWARE\Fortinet)
+    $machineFortinetKey = $null
+    if (Test-Path -LiteralPath (Get-MachineProvider 'Fortinet')) { $machineFortinetKey = Get-MachineNative 'Fortinet' }
+
     # Run roots: machine-wide, then loaded user hives only (signed-out profiles are never mounted)
     $runRoots = @($machineRegistry.Keys | Where-Object { $_ -like 'Run*' } | ForEach-Object { Get-MachineProvider $_ })
     $userKeys = @()
@@ -175,6 +180,15 @@ function Get-Inventory {
         }
     }
 
+    # Per-profile AppData Fortinet folders (files only, no registry hive mounting)
+    $profileFolders = @()
+    foreach ($user in (Get-ChildItem -LiteralPath 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue)) {
+        foreach ($sub in @('AppData\Local\Fortinet', 'AppData\Roaming\Fortinet')) {
+            $candidate = Join-Path $user.FullName $sub
+            if (Test-Path -LiteralPath $candidate) { $profileFolders += $candidate }
+        }
+    }
+
     $services = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object {
         $_.Name -like 'Forti*' -or $_.Name -like 'FA_*' -or $_.Name -like 'FCT_*' -or $_.PathName -like '*\Fortinet\*'
     })
@@ -196,14 +210,16 @@ function Get-Inventory {
 
     $signedOut = @(Get-CimInstance -ClassName Win32_UserProfile -Filter "Special=False AND Loaded=False" -ErrorAction SilentlyContinue | Where-Object { $_.SID -like 'S-1-5-21-*' })
 
-    Write-Log "Inventory: Add/Remove entries $($uninstallEntries.Count), Installer records $($installerKeys.Count), UserData $($userDataKeys.Count), UpgradeCodes $($upgradeValues.Count), per-user keys $($userKeys.Count), Run values $($runValues.Count), services $($services.Count), tasks $($tasks.Count), shortcuts $($shortcuts.Count)"
+    Write-Log "Inventory: Add/Remove entries $($uninstallEntries.Count), Installer records $($installerKeys.Count), UserData $($userDataKeys.Count), UpgradeCodes $($upgradeValues.Count), machine FortiClient root $(if ($machineFortinetKey) { 'yes' } else { 'no' }), per-user keys $($userKeys.Count), Run values $($runValues.Count), profile AppData folders $($profileFolders.Count), services $($services.Count), tasks $($tasks.Count), shortcuts $($shortcuts.Count)"
     foreach ($entry in $uninstallEntries) { Write-Log "   - $($entry.DisplayName) [$($entry.Name)]" }
     foreach ($svc in $services) { Write-Log "   - service $($svc.Name) ($($svc.State), $($svc.StartMode))" }
-    Write-Log "Signed-out profiles (not mounted, not touched): $($signedOut.Count)"
+    foreach ($pf in $profileFolders) { Write-Log "   - profile folder $pf" }
+    Write-Log "Signed-out profiles (registry not mounted; AppData folders still cleaned): $($signedOut.Count)"
 
     return [pscustomobject]@{
         Uninstall = $uninstallEntries; InstallerKeys = $installerKeys; UserDataKeys = $userDataKeys
-        UpgradeValues = $upgradeValues; UserKeys = $userKeys; RunValues = $runValues
+        UpgradeValues = $upgradeValues; MachineFortinet = $machineFortinetKey; UserKeys = $userKeys
+        RunValues = $runValues; ProfileFolders = $profileFolders
         Services = $services; Tasks = $tasks; Shortcuts = $shortcuts
     }
 }
@@ -250,6 +266,7 @@ function Backup-All {
     $keys += $Inv.InstallerKeys
     $keys += $Inv.UserDataKeys
     $keys += $Inv.UpgradeValues | ForEach-Object { $_.Key }
+    $keys += $Inv.MachineFortinet
     $keys += $Inv.UserKeys
     $keys += $Inv.RunValues | ForEach-Object { $_.Key }
     foreach ($key in ($keys | Where-Object { $_ } | Select-Object -Unique)) {
@@ -279,7 +296,7 @@ function Backup-All {
         Copy-Item -LiteralPath $shortcut -Destination $dest -Recurse -Force -ErrorAction SilentlyContinue
         Add-ManifestRow 'Shortcut' $shortcut $dest 0 (Test-Path -LiteralPath $dest) 'best effort'
     }
-    foreach ($folder in $fortinetFolders) {
+    foreach ($folder in ($fortinetFolders + $Inv.ProfileFolders)) {
         if (-not (Test-Path -LiteralPath $folder)) { continue }
         $dest = Join-Path $fileBackupDir ($folder -replace '[^A-Za-z0-9]', '_')
         robocopy.exe $folder $dest /E /COPY:DAT /R:1 /W:1 /NP /NFL /NDL /NJH /NJS | Out-Null
@@ -422,19 +439,21 @@ function Invoke-Cleanup {
     foreach ($key in $Inv.UserDataKeys)  { Remove-RegKey -Key $key -Reason 'UserData record' }
     foreach ($v in $Inv.UpgradeValues)   { Remove-RegValue -Key $v.Key -Name $v.Name }
     foreach ($entry in $Inv.Uninstall)   { Remove-RegKey -Key $entry.Key -Reason 'Add/Remove Programs key' }
+    if ($Inv.MachineFortinet)            { Remove-RegKey -Key $Inv.MachineFortinet -Reason 'machine-wide FortiClient settings' }
     foreach ($key in $Inv.UserKeys)      { Remove-RegKey -Key $key -Reason 'per-user FortiClient record' }
 
-    foreach ($shortcut in $Inv.Shortcuts) { Remove-PathSafe -Path $shortcut }
-    foreach ($folder in $fortinetFolders) { Remove-PathSafe -Path $folder }
+    foreach ($shortcut in $Inv.Shortcuts)                     { Remove-PathSafe -Path $shortcut }
+    foreach ($folder in ($fortinetFolders + $Inv.ProfileFolders)) { Remove-PathSafe -Path $folder }
 }
 
 function Show-Summary {
+    param($Inv)
     $services = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'Forti*' -or $_.Name -like 'FA_*' -or $_.Name -like 'FCT_*' })
     $tasks    = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like '*Forti*' })
-    $folders  = @($fortinetFolders | Where-Object { Test-Path -LiteralPath $_ })
+    $folders  = @(($fortinetFolders + $Inv.ProfileFolders) | Where-Object { Test-Path -LiteralPath $_ })
     Write-Log "Remaining: services $($services.Count), tasks $($tasks.Count), folders $($folders.Count). Queued for reboot: $($script:RebootQueued)"
     if (($script:RebootQueued -gt 0) -or ($folders.Count -gt 0)) { Write-Log "REBOOT REQUIRED to finish removing locked files." }
-    else { Write-Log "Done. Signed-out profiles were not modified." }
+    else { Write-Log "Done. Signed-out profiles' registry hives were not modified." }
 }
 
 # ============================ MAIN ============================
@@ -461,4 +480,4 @@ if (-not (Invoke-Uninstall -Inv $inventory)) {
     return
 }
 Invoke-Cleanup -Inv $inventory
-Show-Summary
+Show-Summary -Inv $inventory
