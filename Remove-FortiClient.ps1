@@ -59,14 +59,19 @@ function Export-RegistryKeyBackup {
 # Backs up the machine-wide trees before anything else. Returns $false if any export fails.
 function Backup-MachineWideRegistry {
     $machineWideBackupSources = @(
-        @{ Source = 'HKLM\SOFTWARE\Classes\Installer\Products';     File = 'Installer_Products.reg' },
-        @{ Source = 'HKLM\SOFTWARE\Classes\Installer\UserData';     File = 'Installer_UserData.reg' },
-        @{ Source = 'HKLM\SOFTWARE\Classes\Installer\UpgradeCodes'; File = 'Installer_UpgradeCodes.reg' },
-        @{ Source = 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall';             File = 'Uninstall64.reg' },
+        @{ Source = 'HKLM\SOFTWARE\Classes\Installer\Products';                            File = 'Installer_Products.reg' },
+        @{ Source = 'HKLM\SOFTWARE\Classes\Installer\UserData';                            File = 'Installer_UserData.reg' },
+        @{ Source = 'HKLM\SOFTWARE\Classes\Installer\UpgradeCodes';                        File = 'Installer_UpgradeCodes.reg' },
+        @{ Source = 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall';            File = 'Uninstall64.reg' },
         @{ Source = 'HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'; File = 'Uninstall32.reg' }
     )
     $allBackupsSucceeded = $true
     foreach ($backupSource in $machineWideBackupSources) {
+        reg.exe query $backupSource.Source | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-RemovalLog " not present, nothing to back up: $($backupSource.Source)"
+            continue
+        }
         $backupTargetFile = Join-Path $registryBackupDirectory $backupSource.File
         reg.exe export $backupSource.Source $backupTargetFile /y | Out-Null
         if (($LASTEXITCODE -ne 0) -or (-not (Test-Path $backupTargetFile))) {
