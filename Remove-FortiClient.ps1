@@ -17,7 +17,6 @@ $fortinetFolderPaths = @(
 
 $script:IsDryRunPass            = $true
 $script:VerifiedRegistryBackups = @{}   # native key path -> verified backup file
-$script:VerifiedFolderBackups   = @{}   # source folder -> verified backup folder
 $script:ManifestRows            = New-Object System.Collections.Generic.List[object]
 $script:RegistryBackupCounter   = 0
 
@@ -228,41 +227,19 @@ function Export-RegistryKeyVerified {
     return $verified
 }
 
-# Copies a folder with robocopy, then verifies every file by SHA256 hash, one manifest row per file.
-function Backup-FolderVerified {
+# Copies a Fortinet folder with robocopy. Best effort: logs the result but never blocks removal.
+function Backup-FolderBestEffort {
     param([string]$SourceFolder)
     $folderBackupName  = $SourceFolder -replace '[^A-Za-z0-9]', '_'
     $destinationFolder = Join-Path $fileBackupDirectory $folderBackupName
 
     robocopy.exe $SourceFolder $destinationFolder /E /COPY:DAT /R:1 /W:1 /NP /NFL /NDL /NJH /NJS | Out-Null
-    if ($LASTEXITCODE -ge 8) {
-        Add-ManifestRow 'Folder' $SourceFolder $destinationFolder 0 $false "robocopy failed, exit code $LASTEXITCODE"
-        return $false
-    }
+    $robocopyExitCode = $LASTEXITCODE
+    $copyCompleted = ($robocopyExitCode -lt 8)
+    $copyStatus = if ($copyCompleted) { 'copied' } else { "incomplete (robocopy exit $robocopyExitCode)" }
 
-    $sourceFiles = @(Get-ChildItem -LiteralPath $SourceFolder -Recurse -File -Force -ErrorAction SilentlyContinue)
-    $allFilesVerified = $true
-    $totalBytes = 0
-    foreach ($sourceFile in $sourceFiles) {
-        $relativePath   = $sourceFile.FullName.Substring($SourceFolder.Length).TrimStart('\')
-        $backupFilePath = Join-Path $destinationFolder $relativePath
-        $backupExists  = Test-Path -LiteralPath $backupFilePath
-        $backupSize    = if ($backupExists) { (Get-Item -LiteralPath $backupFilePath).Length } else { 0 }
-        $hashMatches   = $backupExists -and (
-            (Get-FileHash -LiteralPath $sourceFile.FullName -Algorithm SHA256).Hash -eq
-            (Get-FileHash -LiteralPath $backupFilePath -Algorithm SHA256).Hash
-        )
-        $fileNote = if ($sourceFile.Length -eq 0) { 'source file is 0 bytes' } else { '' }
-        if (-not $hashMatches) { $allFilesVerified = $false }
-        $totalBytes += $sourceFile.Length
-        Add-ManifestRow 'File' $sourceFile.FullName $backupFilePath $backupSize $hashMatches $fileNote
-    }
-
-    $backupFileCount = @(Get-ChildItem -LiteralPath $destinationFolder -Recurse -File -Force -ErrorAction SilentlyContinue).Count
-    $folderVerified = $allFilesVerified -and ($backupFileCount -eq $sourceFiles.Count)
-    Add-ManifestRow 'Folder' $SourceFolder $destinationFolder $totalBytes $folderVerified "$($sourceFiles.Count) files, $backupFileCount in backup"
-    if ($folderVerified) { $script:VerifiedFolderBackups[$SourceFolder] = $destinationFolder }
-    return $folderVerified
+    Add-ManifestRow 'Folder' $SourceFolder $destinationFolder 0 $copyCompleted "best effort, $copyStatus"
+    Write-RemovalLog " file backup (best effort) ${copyStatus}: $SourceFolder -> $destinationFolder"
 }
 
 # Backs up and verifies every item the removal would touch. Returns $false if the machine-wide backup fails.
@@ -312,8 +289,7 @@ function Backup-AllTargetsVerified {
     # Every Fortinet folder that exists
     foreach ($fortinetFolderPath in $fortinetFolderPaths) {
         if (-not (Test-Path -LiteralPath $fortinetFolderPath)) { continue }
-        $folderVerified = Backup-FolderVerified -SourceFolder $fortinetFolderPath
-        Write-RemovalLog " $(if ($folderVerified) { 'verified' } else { 'FAILED' }) folder: $fortinetFolderPath"
+        Backup-FolderBestEffort -SourceFolder $fortinetFolderPath
     }
 
     $manifestRows = $script:ManifestRows
@@ -443,16 +419,16 @@ function Invoke-RemovalPass {
         Remove-RegistryKeySafely -RegistryPathInput $loadedUserKey -RemovalReason 'loaded user hive'
     }
 
-    # 5. Install and data folders (only if their file backup is verified)
+    # 5. Install and data folders (always removed, regardless of file backup result)
     foreach ($fortinetFolderPath in $fortinetFolderPaths) {
         if (-not (Test-Path -LiteralPath $fortinetFolderPath)) { continue }
-        if (-not $script:VerifiedFolderBackups.ContainsKey($fortinetFolderPath)) {
-            Write-RemovalLog " SKIPPED folder (no verified backup): $fortinetFolderPath"
-            continue
-        }
-        if ($IsDryRun) { Write-RemovalLog " WOULD REMOVE folder $fortinetFolderPath, backup: $($script:VerifiedFolderBackups[$fortinetFolderPath])"; continue }
+        if ($IsDryRun) { Write-RemovalLog " WOULD REMOVE folder $fortinetFolderPath"; continue }
         Remove-Item -LiteralPath $fortinetFolderPath -Recurse -Force -ErrorAction SilentlyContinue
-        Write-RemovalLog " REMOVED folder $fortinetFolderPath"
+        if (Test-Path -LiteralPath $fortinetFolderPath) {
+            Write-RemovalLog " WARNING: folder still present after removal: $fortinetFolderPath"
+        } else {
+            Write-RemovalLog " REMOVED folder $fortinetFolderPath"
+        }
     }
 
     Write-RemovalLog "===== $passLabel PASS END ====="
